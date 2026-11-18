@@ -1,125 +1,118 @@
-// main.ts — entrypoint: bind an ephemeral port, register it with the
-// environment, serve the forge until the environment reports done, then exit.
+// main.ts — boot the forge and talk to the make.fun coordinator.
+//
+// Lifecycle: read MAKEFUN_ENV_URL, start the app on a kernel-chosen port,
+// register that port with the coordinator, then keep serving until the
+// coordinator answers {"done": true}, and exit cleanly.
 
 import { createApp } from './app.ts';
 
-const REQUEST_TIMEOUT_MS = 30_000;
-const BACKOFF_START_MS = 250;
-const BACKOFF_MAX_MS = 2000;
+// How long one coordinator request may run before we give up on it.
+const REQUEST_BUDGET_MS = 30_000;
+// First pause between retries; doubles after every failed attempt.
+const FIRST_PAUSE_MS = 250;
+// Retries never wait longer than this between attempts.
+const MAX_PAUSE_MS = 2_000;
 
-const envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-
-if (envUrl === '') {
-  console.error('error: MAKEFUN_ENV_URL is not set');
+function fail(message: string): never {
+  process.stderr.write(`main: ${message}\n`);
   process.exit(1);
 }
 
-const registerUrl = `${envUrl}/register`;
-const doneUrl = `${envUrl}/done`;
+function coordinatorRoot(): string {
+  const raw = process.env.MAKEFUN_ENV_URL ?? '';
+  const trimmed = raw.replace(/\/+$/, '');
+  if (trimmed === '') fail('MAKEFUN_ENV_URL is not set');
+  return trimmed;
+}
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function nextDelay(delay: number): number {
-  return Math.min(delay * 2, BACKOFF_MAX_MS);
-}
-
-async function postRegister(port: number): Promise<number> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  try {
-    const response = await fetch(registerUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ port }),
-      signal: controller.signal,
-    });
-    return response.status;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function pollDone(): Promise<boolean> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  try {
-    const response = await fetch(doneUrl, { signal: controller.signal });
-    if (!response.ok) return false;
-    const body: unknown = await response.json();
-    return (
-      typeof body === 'object' &&
-      body !== null &&
-      (body as { done?: unknown }).done === true
-    );
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function listen(): Promise<{ port: number; close: () => Promise<void> }> {
-  const server = createApp();
-  const port = await new Promise<number>((resolve, reject) => {
-    const onError = (err: Error): void => reject(err);
-    server.once('error', onError);
-    server.listen(0, () => {
-      server.removeListener('error', onError);
-      const address = server.address();
-      if (address === null || typeof address === 'string') {
-        reject(new Error('could not determine the listening port'));
-        return;
-      }
-      resolve(address.port);
-    });
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
   });
-  const close = async (): Promise<void> => {
-    server.closeAllConnections();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  };
-  return { port, close };
 }
 
-async function main(): Promise<void> {
-  const { port, close } = await listen();
-  console.log(`listening on port ${port}`);
+function longerPause(current: number): number {
+  return Math.min(current * 2, MAX_PAUSE_MS);
+}
 
-  let delay = BACKOFF_START_MS;
+function callCoordinator(url: string, init: RequestInit): Promise<Response> {
+  const guard = new AbortController();
+  const timer = setTimeout(() => guard.abort(), REQUEST_BUDGET_MS);
+  return fetch(url, { ...init, signal: guard.signal }).finally(() => {
+    clearTimeout(timer);
+  });
+}
+
+async function announce(root: string, port: number): Promise<void> {
+  let pause = FIRST_PAUSE_MS;
   for (;;) {
-    let status: number;
+    let answer: Response;
     try {
-      status = await postRegister(port);
+      answer = await callCoordinator(`${root}/register`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ port }),
+      });
     } catch {
-      await sleep(delay);
-      delay = nextDelay(delay);
+      await sleep(pause);
+      pause = longerPause(pause);
       continue;
     }
-    if (status === 200 || status === 409) break;
-    if (status === 400 || status === 405) {
-      throw new Error(`register rejected with status ${status}`);
+    if (answer.status === 200 || answer.status === 409) {
+      console.log(`main: registered on port ${port}`);
+      return;
     }
-    await sleep(delay);
-    delay = nextDelay(delay);
+    if (answer.status === 400 || answer.status === 405) {
+      fail(`coordinator refused registration (HTTP ${answer.status})`);
+    }
+    await sleep(pause);
+    pause = longerPause(pause);
   }
-  console.log('registered');
-
-  delay = BACKOFF_START_MS;
-  for (;;) {
-    if (await pollDone()) break;
-    await sleep(delay);
-    delay = nextDelay(delay);
-  }
-  console.log('done');
-
-  await close();
 }
 
-main().then(
-  () => process.exit(0),
-  (err: unknown) => {
-    console.error(err instanceof Error ? err.stack ?? err.message : String(err));
+async function waitForDone(root: string): Promise<void> {
+  let pause = FIRST_PAUSE_MS;
+  for (;;) {
+    try {
+      const answer = await callCoordinator(`${root}/done`, { method: 'GET' });
+      const payload = await answer.json();
+      if (payload !== null && typeof payload === 'object' && payload.done === true) {
+        console.log('main: coordinator reports done');
+        return;
+      }
+    } catch {
+      // A failed or slow poll is just another retry.
+    }
+    await sleep(pause);
+    pause = longerPause(pause);
+  }
+}
+
+async function run(): Promise<void> {
+  const root = coordinatorRoot();
+  const server = createApp();
+  const port = await new Promise<number>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, () => {
+      const bound = server.address();
+      if (typeof bound === 'object' && bound !== null) resolve(bound.port);
+      else reject(new Error('could not learn the bound port'));
+    });
+  });
+  console.log(`main: listening on port ${port}`);
+  await announce(root, port);
+  await waitForDone(root);
+  await new Promise<void>((resolve) => {
+    server.close(() => resolve());
+    server.closeAllConnections();
+  });
+  console.log('main: shutting down');
+}
+
+run()
+  .then(() => process.exit(0))
+  .catch((err: unknown) => {
+    const text = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`main: ${text}\n`);
     process.exit(1);
-  },
-);
+  });
